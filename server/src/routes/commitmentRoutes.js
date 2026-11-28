@@ -2,84 +2,47 @@
 import express from "express";
 import mongoose from "mongoose";
 import Commitment from "../models/Commitment.js";
-import Customer from "../models/Customer.js";
+import {
+  CUSTOMER_PROJECTION,
+  CommitmentError,
+  createConfirmedCommitment,
+} from "../services/commitmentService.js";
 
 const router = express.Router();
 
-// Create a payment commitment
+// Create a payment commitment or payment received record
 router.post("/", async (req, res) => {
   try {
-    const {
-      customerId,
-      amount,
-      promisedDate,
-      originalMessage,
-    } = req.body;
+    const { commitment, isPaymentReceived } = await createConfirmedCommitment(
+      req.body || {}
+    );
 
-    if (!customerId || !mongoose.isValidObjectId(customerId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid customer ID is required",
-      });
-    }
-
-    if (!amount || Number(amount) <= 0 || !Number.isFinite(Number(amount))) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid amount is required",
-      });
-    }
-
-    if (!promisedDate || Number.isNaN(Date.parse(promisedDate))) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid promised date is required",
-      });
-    }
-
-    if (!originalMessage?.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Original message is required",
-      });
-    }
-
-    const customer = await Customer.findById(customerId);
-
-    if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: "Customer not found",
-      });
-    }
-
-    const commitment = await Commitment.create({
-      customer: customerId,
-      amount: Number(amount),
-      promisedDate: new Date(promisedDate),
-      originalMessage,
-    });
-
-    const populatedCommitment = await commitment.populate("customer");
-
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      message: "Payment commitment created successfully",
-      data: populatedCommitment,
+      message: isPaymentReceived
+        ? "Payment received recorded successfully"
+        : "Payment commitment created successfully",
+      data: commitment,
     });
   } catch (error) {
-    res.status(500).json({
+    if (error instanceof CommitmentError) {
+      return res.status(error.status).json({
+        success: false,
+        message: error.message,
+      });
+    }
+    return res.status(500).json({
       success: false,
       message: error.message,
     });
   }
 });
 
-// Get all payment commitments
+// Get all confirmed payment commitments
 router.get("/", async (req, res) => {
   try {
-    const commitments = await Commitment.find()
-      .populate("customer", "name phone preferredLanguage")
+    const commitments = await Commitment.find({ confirmedByVendor: true })
+      .populate("customer", CUSTOMER_PROJECTION)
       .sort({ createdAt: -1 });
 
     res.json({
@@ -115,6 +78,13 @@ router.patch("/:id/payment", async (req, res) => {
       });
     }
 
+    if (commitment.confirmedByVendor !== true) {
+      return res.status(400).json({
+        success: false,
+        message: "Commitment must be confirmed by vendor before recording payment",
+      });
+    }
+
     if (commitment.paymentStatus === "Paid") {
       return res.status(400).json({
         success: false,
@@ -122,10 +92,30 @@ router.patch("/:id/payment", async (req, res) => {
       });
     }
 
+    const prevStatus = commitment.status;
+    if (!commitment.originalAmount) {
+      commitment.originalAmount = commitment.amount;
+    }
+    commitment.paidAmount = commitment.originalAmount;
     commitment.paymentStatus = "Paid";
     commitment.paidAt = new Date();
+    if (commitment.status === "Pending" || commitment.status === "Renegotiated") {
+      commitment.status = "Kept";
+    }
+    commitment.history.push({
+      action: "payment_marked_received",
+      previousAmount: commitment.amount,
+      newAmount: commitment.amount,
+      previousPromisedDate: commitment.promisedDate,
+      newPromisedDate: commitment.promisedDate,
+      previousStatus: prevStatus,
+      newStatus: commitment.status,
+      note: "Payment marked as received by vendor",
+      actor: "vendor",
+    });
 
     await commitment.save();
+    await commitment.populate("customer", CUSTOMER_PROJECTION);
 
     res.json({
       success: true,
@@ -164,6 +154,7 @@ router.patch("/:id/confirm", async (req, res) => {
 
     commitment.confirmedByVendor = true;
     await commitment.save();
+    await commitment.populate("customer", CUSTOMER_PROJECTION);
 
     res.json({
       success: true,
@@ -181,7 +172,7 @@ router.patch("/:id/confirm", async (req, res) => {
 router.patch("/:id/status", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status } = req.body || {};
 
     const allowedStatuses = [
       "Pending",
@@ -213,8 +204,35 @@ router.patch("/:id/status", async (req, res) => {
       });
     }
 
+    if (commitment.confirmedByVendor !== true) {
+      return res.status(400).json({
+        success: false,
+        message: "Commitment must be confirmed by vendor before updating status",
+      });
+    }
+
+    if (commitment.paymentStatus === "Paid" && status === "Pending") {
+      return res.status(400).json({
+        success: false,
+        message: "Paid commitment cannot be set back to Pending",
+      });
+    }
+
+    const prevStatus = commitment.status;
     commitment.status = status;
+    commitment.history.push({
+      action: "status_updated",
+      previousAmount: commitment.amount,
+      newAmount: commitment.amount,
+      previousPromisedDate: commitment.promisedDate,
+      newPromisedDate: commitment.promisedDate,
+      previousStatus: prevStatus,
+      newStatus: status,
+      note: `Status changed from ${prevStatus} to ${status}`,
+      actor: "vendor",
+    });
     await commitment.save();
+    await commitment.populate("customer", CUSTOMER_PROJECTION);
 
     res.json({
       success: true,
